@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
 import time
 from collections import Counter
@@ -1396,13 +1397,32 @@ def build_scrapers(http: Http, workers: int) -> dict:
 def run_pipeline(sources: Iterable[str] = SOURCE_KEYS, out_dir: str | Path = "data",
                  max_jobs: int | None = None, workers: int = 4,
                  delay: float = 0.5) -> pd.DataFrame:
-    """Crawl the selected sources, save raw/clean/master CSVs, return the master DataFrame."""
+    """Crawl the selected sources, save raw/clean/master CSVs, return the master DataFrame.
+
+    If MONGODB_URI is set, every posting is also written to MongoDB (see mongo_store.py),
+    and MongoDB becomes the record of first/last-seen dates and closures.
+    """
+    import time as _time
+    from datetime import datetime, timezone
+
+    started = datetime.now(timezone.utc)
+    t0 = _time.monotonic()
     out_dir = Path(out_dir)
     today = date.today().isoformat()
     http = Http(delay=delay)
     scrapers = build_scrapers(http, workers)
 
-    frames, closed_frames, sources_ok = [], [], set()
+    store = None
+    try:
+        from mongo_store import MongoStore
+        store = MongoStore.from_env(test_run=bool(max_jobs))
+    except ImportError:
+        if os.environ.get("MONGODB_URI"):
+            raise
+    if store is None:
+        log.info("MONGODB_URI not set: CSV output only")
+
+    frames, closed_frames, sources_ok, failed, per_source = [], [], set(), [], {}
     for key in sources:
         scraper = scrapers[key]
         log.info("=== %s ===", scraper.name)
@@ -1410,25 +1430,46 @@ def run_pipeline(sources: Iterable[str] = SOURCE_KEYS, out_dir: str | Path = "da
             raw = scraper.scrape(max_jobs)
         except Exception:  # noqa: BLE001 - one site failing shouldn't stop the others
             log.exception("%s: crawl failed, skipping", scraper.name)
+            failed.append(scraper.name)
             continue
         save_csv(pd.DataFrame(raw), out_dir / "raw" / f"{key}_raw_{today}.csv")
-        clean = finalize((scraper.enrich(r) for r in raw), scraper.key, scraper.name, today)
+        enriched = [scraper.enrich(r) for r in raw]
+        if store:
+            store.save_raw(scraper.name,
+                           [(f"{scraper.key}_{e.get('Job_ID')}", r) for r, e in zip(raw, enriched)],
+                           today)
+        clean = finalize(enriched, scraper.key, scraper.name, today)
         save_csv(clean, out_dir / "clean" / f"{key}_clean_{today}.csv")
         open_rows, closed_rows = split_open_closed(clean)
         frames.append(open_rows)
         closed_frames.append(closed_rows[MASTER_COLUMNS])
         sources_ok.add(scraper.name)
+        per_source[scraper.name] = {"open": len(open_rows), "closed_listed": len(closed_rows)}
 
     if not sources_ok:
         raise RuntimeError("No source returned data")
     master = pd.concat([f[MASTER_COLUMNS] for f in frames], ignore_index=True)
+    closed_all = pd.concat(closed_frames, ignore_index=True)
     save_csv(master, out_dir / f"saskatchewan_public_sector_jobs_master_{today}.csv")
     summarize(master)
 
-    if max_jobs:
+    if store:
+        try:
+            stats = store.sync(master, closed_all, sources_ok, today, close_missing=not max_jobs)
+            log.info("MongoDB: %s", stats)
+            store.log_run({
+                "run_date": today, "started_at": started,
+                "duration_s": round(_time.monotonic() - t0, 1),
+                "test_run": bool(max_jobs), "max_jobs": max_jobs,
+                "sources_ok": sorted(sources_ok), "sources_failed": failed,
+                "per_source": per_source, "open_postings": len(master), **stats,
+            })
+        finally:
+            store.close()
+    elif max_jobs:
         log.info("MAX_JOBS is set (test run): history files not updated")
     else:
-        update_history(master, pd.concat(closed_frames, ignore_index=True), sources_ok, out_dir, today)
+        update_history(master, closed_all, sources_ok, out_dir, today)
     return master
 
 

@@ -27,5 +27,16 @@ python sk_jobs_scraper.py                    # full crawl
 - `history/open_postings_tracker.csv` open postings with first/last seen dates
 - `past_postings_master.csv` every closed posting collected so far
 
-## Roadmap
-- [ ] Write postings to MongoDB Atlas (upserts keyed on `Record_ID`)
+## MongoDB
+When the `MONGODB_URI` environment variable is set (a GitHub Actions secret in the scheduled
+runs), every run also writes to MongoDB (`mongo_store.py`), and the database holds the history:
+
+| Collection | Contents |
+|---|---|
+| `postings` | One document per posting (`_id` = `Record_ID`), with `first_seen`, `last_seen`, `status` (open/closed), `closed_date`, `closed_reason` |
+| `raw_postings` | Latest raw scrape of each posting, before cleaning |
+| `posting_changes` | Salary, closing date, title, etc. changes on open postings |
+| `runs` | One summary per run: counts, failed sources, duration |
+
+Test runs (`--max-jobs`) write to a separate `sk_jobs_test` database. Closures are skipped for
+a source when a run lists under half of its currently open postings (likely a partial crawl).
