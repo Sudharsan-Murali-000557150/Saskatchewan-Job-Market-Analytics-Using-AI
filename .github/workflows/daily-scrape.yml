@@ -60,7 +60,13 @@ jobs:
             echo "No data changes."
           else
             git commit -m "Daily scrape $(TZ=America/Regina date +%F)"
-            git push
+            # The repo may have changed while the scrape ran: fold those changes in, then push.
+            for attempt in 1 2 3; do
+              git pull --rebase origin "${GITHUB_REF_NAME}" && git push && exit 0
+              echo "Push attempt $attempt failed, retrying..."
+              sleep 5
+            done
+            exit 1
           fi
 
       - name: Upload run output (kept 14 days)
