@@ -17,7 +17,7 @@ defaults:
     working-directory: sk-jobs-pipeline
 
 permissions:
-  contents: write           # lets the run commit the updated CSVs back to the repo
+  contents: write           # only used when MongoDB isn't configured (CSV fallback commits data)
 
 concurrency:
   group: daily-scrape       # never run two scrapes at the same time
@@ -27,6 +27,8 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}   # Settings -> Secrets and variables -> Actions
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -51,7 +53,10 @@ jobs:
             python sk_jobs_scraper.py --out-dir data
           fi
 
-      - name: Commit updated data
+      # With MongoDB configured, the database holds the history, so CSVs are no longer
+      # committed (they would bloat the repo); they are still kept as a run artifact below.
+      - name: Commit updated data (CSV fallback, only without MongoDB)
+        if: env.MONGODB_URI == ''
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898699+github-actions[bot]@users.noreply.github.com"
