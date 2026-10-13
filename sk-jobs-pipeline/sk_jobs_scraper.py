@@ -1,13 +1,45 @@
 #!/usr/bin/env python3
-"""Saskatchewan public-sector job scraper (script version of sk_jobs_scraper.ipynb).
-
-Run locally:      python sk_jobs_scraper.py --out-dir data
-Quick test:       python sk_jobs_scraper.py --max-jobs 20
-Scheduled runs:   .github/workflows/daily-scrape.yml
 """
+sk_jobs_scraper.py - Saskatchewan public-sector job postings crawler.
 
+Sources (key: employer - platform)
+----------------------------------
+* gos:        Government of Saskatchewan           - Oracle HCM Candidate Experience
+* sha:        Saskatchewan Health Authority        - Oracle HCM Candidate Experience
+* saskpower:  SaskPower                            - SAP SuccessFactors
+* saskenergy: SaskEnergy                           - Workday
+* saskwater:  SaskWater                            - WordPress page + PDF postings (+ PDF archive)
+* sasktel:    SaskTel                              - SAP SuccessFactors
+* sgi:        SGI / SGI CANADA                     - Workday
+* slga:       Saskatchewan Liquor and Gaming Auth. - ApplyToJob (JazzHR)
+* lgs:        Lotteries and Gaming Saskatchewan    - careers page + PDF postings
+
+Only each employer's public careers page is configured below. Everything else
+(API hosts, job-board URLs, job lists, posting links) is discovered at run time.
+
+Usage
+-----
+Command line:
+    python sk_jobs_scraper.py                         # all sources
+    python sk_jobs_scraper.py --sources gos sgi slga  # subset
+    python sk_jobs_scraper.py --max-jobs 20           # quick test run (history not updated)
+
+Colab / Jupyter:
+    from sk_jobs_scraper import run_pipeline
+    master = run_pipeline(out_dir="/content/drive/MyDrive/Capstone/sk_jobs_data")
+
+Outputs (in --out-dir, default ./data):
+    raw/<source>_raw_<date>.csv          records as returned by the site
+    clean/<source>_clean_<date>.csv      cleaned, all source-specific columns
+    saskatchewan_public_sector_jobs_master_<date>.csv   open postings, common schema
+    past_postings_master.csv             every closed posting seen so far (grows each run)
+    history/open_postings_tracker.csv    open postings with first/last seen dates
+
+Requires: requests, beautifulsoup4, pandas, pypdf
+"""
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import logging
@@ -31,11 +63,18 @@ from urllib3.util.retry import Retry
 
 log = logging.getLogger("sk_jobs")
 
+# =============================================================================
+# Configuration - the only URLs in this file
+# =============================================================================
 GOS_CAREER_PAGE = "https://careers.saskatchewan.ca/en/sites/CX_1"
 SHA_CAREER_PAGE = "https://emqk.fa.ca3.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001"
 SASKPOWER_CAREER_SITE = "https://jobs.saskpower.com"
 SASKENERGY_CAREER_PAGE = "https://www.saskenergy.com/careers"
 SASKTEL_CAREER_SITE = "https://jobs.sasktel.com"
+# sgi.sk.ca/careers builds its links with JavaScript from this JSON file
+SGI_CAREER_PAGE = "https://sgi.sk.ca/res/sgi/careers.json"
+SLGA_CAREER_PAGE = "https://www.slga.com/careers"
+LGS_CAREER_PAGE = "https://lgsask.com/about-us/careers"
 SASKWATER_CAREER_PAGE = "https://www.saskwater.com/why-work-at-saskwater/"
 
 LOCAL_TZ = "America/Regina"
@@ -56,6 +95,10 @@ MASTER_COLUMNS = [
     "Collection_Date",
 ]
 
+
+# =============================================================================
+# HTTP
+# =============================================================================
 class Http:
     """requests.Session with retries/backoff and a polite delay after each call."""
 
@@ -120,6 +163,10 @@ def fetch_parallel(items: list, fn: Callable, workers: int, label: str) -> list:
                 log.info("%s: %d/%d details fetched (%d failed)", label, n, len(items), failed)
     return [r for r in results if r is not None]
 
+
+# =============================================================================
+# Generic text / value cleaning
+# =============================================================================
 def is_blank(value) -> bool:
     if value is None:
         return True
@@ -331,6 +378,10 @@ def split_org_code(value: str | None) -> tuple[str | None, str | None]:
     m = re.match(r"^\s*(\d+)\s+(.*)$", str(value))
     return (m.group(1), m.group(2).strip()) if m else (None, str(value).strip())
 
+
+# =============================================================================
+# Oracle HCM Candidate Experience (Government of Saskatchewan, SHA)
+# =============================================================================
 @dataclass
 class OracleSite:
     key: str                     # Record_ID prefix
@@ -545,6 +596,10 @@ def enrich_sha(record: dict) -> dict:
         r["City"] = split_location(r.get("Location_Raw"))[0] or city_town
     return r
 
+
+# =============================================================================
+# SaskPower (SAP SuccessFactors career site)
+# =============================================================================
 _SECTION_HEADING = re.compile(r"^([A-Z][A-Z0-9 /&'\-]{2,60}):\s*$")
 _BOILERPLATE = re.compile(
     r"Candidates under consideration|At SaskPower, we believe|Please apply by", re.I)
@@ -706,48 +761,82 @@ class SaskPowerScraper:
         r["Description"] = squash(text)
         return r
 
+
+# =============================================================================
+# Workday (SaskEnergy, SGI, and any other employer on *.myworkdayjobs.com)
+# =============================================================================
 _WORKDAY_URL = re.compile(r"https://[\w.-]+\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?[\w-]+")
 _UNION_PATTERN = re.compile(r"\b(?:COPE|CUPE|SEIU|SGEU|IBEW|Unifor|UFCW|OPEIU)\b(?:[\s,]*Local\s*\d+)?", re.I)
 
-# keyword found in a section heading (lower-case) -> output column; first match wins
+# Keyword found in a major section heading (lower-case) -> output column; first match wins.
+# Several sections can feed one column (e.g. 'Education' + 'Experience' -> Qualifications).
+# A heading that matches nothing (e.g. 'Application Instructions') goes to no column.
 WORKDAY_SECTIONS = [
-    ("accountabilities", "Responsibilities"),
-    ("responsibilities", "Responsibilities"),
+    ("general accountability", "Job_Summary"),
+    ("summary", "Job_Summary"),
+    ("accountabilit", "Responsibilities"),
+    ("responsibilit", "Responsibilities"),
     ("duties", "Responsibilities"),
-    ("knowledge/skills", "Qualifications"),
-    ("qualifications", "Qualifications"),
-    ("requirements", "Qualifications"),
+    ("knowledge", "Qualifications"),
+    ("qualification", "Qualifications"),
+    ("education", "Qualifications"),
+    ("experience", "Qualifications"),
+    ("requirement", "Qualifications"),
+    ("competenc", "Competencies"),
+    ("working conditions", "Working_Conditions"),
     ("position details", "Position_Details"),
     ("additional information", "Additional_Information"),
     ("salary", "Salary_Range"),
     ("rate range", "Salary_Range"),
+    ("pay range", "Salary_Range"),
     ("compensation", "Salary_Range"),
     ("closing date", "Closing_Date_Text"),
+    ("posting close", "Closing_Date_Text"),
 ]
+# Facts some employers write as plain lines instead of sections (e.g. SGI)
+_PAY_TEXT = re.compile(r"\b(?:Pay Range|Salary(?: Range)?|Hourly Rate(?: Range)?)\s*:\s*([^\n]{3,80})", re.I)
+_CLOSE_TEXT = re.compile(r"\b(?:Posting Close(?: Date)?|Closes|Closing Date|closes on)\s*:?\s*"
+                         r"(?:[A-Z][a-z]+day,?\s*)?([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})")
+_SCOPE_TEXT = re.compile(r"\b(in|out[- ]of)[- ]scope\b", re.I)
+# Closing boilerplate that runs on at the end of the last section - cut it off there
+_WD_BOILERPLATE = re.compile(r"(?:At SGI, we|We value diversity|If you require an accommodation|Join us and help"
+                             r"|Diversity is a cornerstone|This position closes on|As you prepare to submit|We thank all applicants)", re.I)
 
 
-def html_sections(html: str | None) -> tuple[str, dict[str, str]]:
-    """Split a posting's HTML on its headings (<h1>-<h5>, or a <p> that is only bold text).
+def _is_major_heading(el) -> bool:
+    """h1-h5, underlined bold, or ALL-CAPS bold text - not bold sub-headings like 'Leadership'."""
+    text = el.get_text(" ", strip=True)
+    if not text or len(text) > 60 or not re.search(r"[A-Za-z]", text):
+        return False
+    return el.name in ("h1", "h2", "h3", "h4", "h5") or el.find("u") is not None or el.name == "u" \
+        or text.upper() == text
 
-    Returns (intro text before the first heading, {heading_lower: section text}).
+
+def html_sections(html: str | None) -> tuple[str, list[tuple[str, str]], str]:
+    """Split a posting's HTML on its major headings.
+
+    A heading is an <h1>-<h5>, or bold text at the start of a paragraph that is underlined
+    or ALL CAPS ('KEY ACCOUNTABILITIES Note: ...' splits after the caps part). Bold
+    sub-headings stay inside their section. Returns (intro, [(heading_lower, text)], full_text).
     """
     soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "p"]):
-        text = tag.get_text(" ", strip=True)
-        if not text:
+        if tag.name != "p":
+            if _is_major_heading(tag):
+                tag.replace_with(f"\n@@SECTION@@{tag.get_text(' ', strip=True)}\n")
             continue
-        is_heading = tag.name != "p" or (
-            tag.find(["b", "strong"]) and tag.find(["b", "strong"]).get_text(" ", strip=True) == text)
-        if is_heading and len(text) <= 60:
-            tag.replace_with(f"\n@@SECTION@@{text}\n")
+        first = next((c for c in tag.children  # skip <br/> and empty tags before the text
+                      if (c.get_text(strip=True) if getattr(c, "name", None) else str(c).strip())), None)
+        while getattr(first, "name", None) == "span" and first.find(["b", "strong"]):
+            first = first.find(["b", "strong"])  # <p><span><b>Heading</b></span></p>
+        if getattr(first, "name", None) in ("b", "strong", "u") and _is_major_heading(first):
+            first.replace_with(f"\n@@SECTION@@{first.get_text(' ', strip=True)}\n")
     for li in soup.find_all("li"):
         li.insert_before("\n• ")
-    parts = re.split(r"@@SECTION@@(.+)", soup.get_text("\n"))
-    intro = squash(parts[0])
-    sections = {}
-    for heading, body in zip(parts[1::2], parts[2::2]):
-        sections.setdefault(heading.strip().lower(), squash(body))
-    return intro, sections
+    full = soup.get_text("\n")
+    parts = re.split(r"@@SECTION@@(.+)", full)
+    sections = [(h.strip().lower(), squash(b)) for h, b in zip(parts[1::2], parts[2::2])]
+    return squash(parts[0]), sections, full.replace("@@SECTION@@", "")
 
 
 @dataclass
@@ -875,15 +964,18 @@ class WorkdayScraper:
     @staticmethod
     def enrich(record: dict) -> dict:
         r = dict(record)
-        intro, sections = html_sections(r.pop("Description_HTML", None))
+        intro, sections, full = html_sections(r.pop("Description_HTML", None))
+        collected: dict[str, list[str]] = {}
         salary_heading = ""
-        for heading, text in sections.items():
-            for keyword, column in WORKDAY_SECTIONS:
-                if keyword in heading:
-                    if not r.get(column):
-                        r[column] = text
-                        salary_heading = heading if column == "Salary_Range" else salary_heading
-                    break
+        for heading, text in sections:
+            column = next((col for keyword, col in WORKDAY_SECTIONS if keyword in heading), None)
+            text = _WD_BOILERPLATE.split(text)[0].strip()
+            if column and text:
+                collected.setdefault(column, []).append(text)
+                if column == "Salary_Range" and not salary_heading:
+                    salary_heading = heading
+        for column, texts in collected.items():
+            r[column] = squash(" ".join(texts))
 
         details = r.get("Position_Details") or ""
         employment = " ".join(p for p in (r.get("Worker_Type"), r.get("Time_Type")) if p)
@@ -891,24 +983,39 @@ class WorkdayScraper:
                                 or find_employment_type(intro or ""))
 
         named = _UNION_PATTERN.search(details) or _UNION_PATTERN.search(intro or "")
-        scope = re.match(r"\W*(non[\s-]?union|union)\b", details, re.I)
+        union_word = re.match(r"\W*(non[\s-]?union|union)\b", details, re.I)
+        scope = _SCOPE_TEXT.search(full)
         if named:
             r["Union"] = squash(named.group(0))
+        elif union_word:
+            r["Union"] = "Non-union" if union_word.group(1).lower().startswith("non") else "Union"
         elif scope:
-            r["Union"] = "Non-union" if scope.group(1).lower().startswith("non") else "Union"
+            r["Union"] = "In-scope (union)" if scope.group(1).lower() == "in" else "Out-of-scope (non-union)"
         else:
             r["Union"] = None
 
+        if not r.get("Salary_Range"):
+            pay = _PAY_TEXT.search(full)
+            r["Salary_Range"] = pay.group(1) if pay else None
         if r.get("Salary_Range"):
             # '$39.91 ($6,474.20) - $47.84 ($7,760.60)  #LI-POST' -> '$39.91 - $47.84'
             pay = re.sub(r"#\w+(?:-\w+)*|\(\s*\$[^)]*\)", "", r["Salary_Range"])
             if "hourly" in salary_heading and "hour" not in pay.lower():
                 pay = f"Hourly: {pay}"
             r["Salary_Range"] = squash(pay) or None
-        r["Closing_Date"] = r.pop("Closing_Date_Text", None) or r.get("Closing_Date_Posted")
-        r["Description"] = squash(" ".join(filter(None, [intro, *sections.values()])))
+
+        closing = r.pop("Closing_Date_Text", None)
+        if not closing:
+            found = _CLOSE_TEXT.search(full)
+            closing = found.group(1) if found else None
+        r["Closing_Date"] = closing or r.get("Closing_Date_Posted")
+        r["Description"] = squash(" ".join(filter(None, [intro] + [t for _, t in sections])))
         return r
 
+
+# =============================================================================
+# SaskWater (WordPress site, each posting is a PDF)
+# =============================================================================
 _COMPETITION = re.compile(r"\bSW[-\s]?(\d{1,3})[-\s](\d{4})\b", re.I)
 _PDF_FIELD = re.compile(
     r"^\s*(Job Title|Job Competition|Competition\s*#?|Location|Salary(?: Range)?|"
@@ -1105,6 +1212,10 @@ class SaskWaterScraper:
         r["Job_URL"] = r["PDF_URL"]
         return r
 
+
+# =============================================================================
+# SaskTel (SAP SuccessFactors - same platform as SaskPower, different posting layout)
+# =============================================================================
 # 'Label:' lines at the top of each posting -> column. The value may sit on the same
 # line or the next one, and SaskTel sometimes writes 'Salary' / ': $27.42' on two lines.
 SASKTEL_LABELS = {
@@ -1234,6 +1345,265 @@ class SaskTelScraper(SaskPowerScraper):
                                           len(lines))]))
         return r
 
+
+# =============================================================================
+# Shared: split plain-text postings on heading lines
+# =============================================================================
+def text_sections(lines: list[str], headings: list[tuple[str, str | None]],
+                  max_words: int = 10) -> tuple[str, dict[str, str]]:
+    """Split posting text on short heading lines ('Primary Responsibilities', 'Qualifications:').
+
+    `headings` is [(keyword, column)], first match wins; column None = a known heading whose
+    text is dropped (e.g. 'How to Apply'). A heading line is short, doesn't end in a full stop,
+    and contains a keyword. Returns (intro before the first heading, {column: text}).
+    """
+    out: dict[str, list[str]] = {}
+    intro, current, seen_heading = [], None, False
+    for line in lines:
+        clean = line.strip().rstrip(":").strip()
+        lower = clean.lower()
+        is_heading = (clean and len(clean.split()) <= max_words and not clean.endswith(".")
+                      and not clean.startswith(("•", "-", "*")))
+        column = next((col for kw, col in headings if kw in lower), "__none__") if is_heading else "__none__"
+        if column != "__none__":
+            current, seen_heading = column, True
+            continue
+        if not seen_heading:
+            intro.append(line)
+        elif current:
+            out.setdefault(current, []).append(line)
+    return squash("\n".join(intro)) or "", {col: squash("\n".join(v)) for col, v in out.items() if v}
+
+
+_SCOPE_WORD = re.compile(r"\b(in|out[- ]of)[- ]scope\b", re.I)
+_OPENINGS = re.compile(r"^\(?(\d{1,2})\)?\s+(?=\w)")      # '(3) Permanent Part-Time ...', '1 Full Time ...'
+_MONEY_RANGE = re.compile(r"\$\s?[\d,]+(?:\.\d+)?\s*(?:-|–|to)\s*\$?\s?[\d,]+(?:\.\d+)?[^\n.]{0,40}")
+_DEADLINE = re.compile(r"(?:application deadline|deadline for receipt of applications?|closing date|closes?)"
+                       r"[^A-Za-z]{0,40}?(?:is\s+)?(?:\d{1,2}:\d{2}\s*[ap]\.?m\.?,?\s*)?"
+                       r"(?:[A-Z][a-z]+day,?\s*)?([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})", re.I | re.S)
+
+
+def union_from_scope(text: str) -> str | None:
+    m = _SCOPE_WORD.search(text or "")
+    if not m:
+        return None
+    return "In-scope (union)" if m.group(1).lower() == "in" else "Out-of-scope (non-union)"
+
+
+# =============================================================================
+# ApplyToJob / JazzHR job boards (SLGA)
+# =============================================================================
+APPLYTOJOB_SECTIONS = [
+    ("responsibilit", "Responsibilities"),
+    ("duties", "Responsibilities"),
+    ("qualification", "Qualifications"),
+    ("knowledge", "Qualifications"),
+    ("requirements", "Qualifications"),
+    ("competenc", "Competencies"),
+    ("working conditions", "Working_Conditions"),
+    ("what we offer", "Benefits"),
+]
+_APPLYTOJOB_URL = re.compile(r"https?://[\w-]+\.applytojob\.com")
+_SALARY_UNIT = {"HOUR": "per hour", "YEAR": "per year", "MONTH": "per month", "WEEK": "per week", "DAY": "per day"}
+
+
+class ApplyToJobScraper:
+    """Any employer whose careers page links to <company>.applytojob.com."""
+
+    def __init__(self, key: str, name: str, career_page: str, http: Http, workers: int = 4,
+                 fallback_board: str | None = None):
+        self.key, self.name = key, name
+        self.career_page = career_page
+        self.fallback_board = fallback_board
+        self.http = http
+        self.workers = workers
+        self.board: str | None = None
+
+    def discover_board(self) -> str:
+        try:
+            found = _APPLYTOJOB_URL.findall(self.http.get(self.career_page).text)
+            if found:
+                return Counter(found).most_common(1)[0][0].replace("http://", "https://")
+        except requests.RequestException as exc:
+            log.warning("%s: could not load career page (%s)", self.name, exc)
+        if self.fallback_board:
+            log.warning("%s: job board link not found in page, using fallback", self.name)
+            return self.fallback_board
+        raise RuntimeError(f"{self.name}: could not discover the job board")
+
+    def list_jobs(self, max_jobs: int | None = None) -> list[dict]:
+        soup = self.http.soup(f"{self.board}/apply")
+        jobs = {}
+        for item in soup.select("li.list-group-item"):
+            link = item.select_one("a[href*='/apply/']")
+            if not link:
+                continue
+            m = re.search(r"/apply/([A-Za-z0-9]+)/", link["href"])
+            if not m:
+                continue
+            facts = {}
+            for li in item.select("ul li"):
+                icon = li.find("i")
+                cls = " ".join(icon.get("class", [])) if icon else ""
+                facts["Location_Raw" if "map-marker" in cls else "Category" if "sitemap" in cls else "Other"] = \
+                    squash(li.get_text(" ", strip=True))
+            jobs[m.group(1)] = {"Job_ID": m.group(1), "Job_Title": squash(link.get_text(" ", strip=True)),
+                                "Job_URL": urljoin(self.board, link["href"]),
+                                "Location_Raw": facts.get("Location_Raw"), "Category": facts.get("Category")}
+        log.info("%s: listed %d", self.name, len(jobs))
+        items = list(jobs.values())
+        return items[:max_jobs] if max_jobs else items
+
+    def get_detail(self, listing: dict) -> dict:
+        soup = self.http.soup(listing["Job_URL"])
+        posting = {}
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "{}")
+            except ValueError:
+                continue
+            if isinstance(data, dict) and data.get("@type") == "JobPosting":
+                posting = data
+        salary = ((posting.get("baseSalary") or {}).get("value") or {})
+        address = (((posting.get("jobLocation") or {}).get("address")) or {})
+        desc = soup.select_one("#job-description") or soup.select_one(".description")
+        return {
+            **listing,
+            "Job_Title": posting.get("title") or listing["Job_Title"],
+            "Organization": (posting.get("hiringOrganization") or {}).get("name") or self.name,
+            "City": address.get("addressLocality"),
+            "Province": address.get("addressRegion"),
+            "Posting_Date": posting.get("datePosted"),
+            "Valid_Through": posting.get("validThrough"),
+            "Employment_Type_Board": posting.get("employmentType"),
+            "Experience_Level_Board": posting.get("experienceRequirements"),
+            "Salary_Min_Board": salary.get("minValue"),
+            "Salary_Max_Board": salary.get("maxValue"),
+            "Salary_Unit_Board": salary.get("unitText"),
+            "Description_Raw": desc.get_text("\n", strip=True) if desc else None,
+        }
+
+    def scrape(self, max_jobs: int | None = None) -> list[dict]:
+        self.board = self.discover_board()
+        log.info("%s: job board %s", self.name, self.board)
+        return fetch_parallel(self.list_jobs(max_jobs), self.get_detail, self.workers, self.name)
+
+    @staticmethod
+    def enrich(record: dict) -> dict:
+        r = dict(record)
+        text = (r.pop("Description_Raw", None) or "").replace("\xa0", " ")
+        lines = [squash(line) for line in text.splitlines() if squash(line)]
+        intro, sections = text_sections(lines, APPLYTOJOB_SECTIONS)
+        r.update(sections)
+
+        # Header lines: '(3) Permanent Part-Time Material Handler', 'In-Scope Level 03', 'Vacancy #17F27'
+        head = "\n".join(lines[:6])
+        first = lines[0] if lines else ""
+        openings = _OPENINGS.match(first)
+        r["Number_of_Openings"] = int(openings.group(1)) if openings else 1
+        r["Employment_Type"] = (find_employment_type(first)
+                                or (r.get("Employment_Type_Board") or "").replace("_", " ").title() or None)
+        level = re.search(r"\b(?:in|out[- ]of)[- ]scope\s+level\s*(\d+)", head, re.I)
+        r["Pay_Level"] = int(level.group(1)) if level else None
+        r["Union"] = union_from_scope(head)
+        vacancy = re.search(r"Vacancy\s*(?:number|#|no\.?)?\s*:?\s*([\w/-]+)", text, re.I)
+        r["Vacancy_Number"] = vacancy.group(1) if vacancy else None
+
+        if r.get("Salary_Min_Board") is not None:
+            unit = _SALARY_UNIT.get(str(r.get("Salary_Unit_Board") or "").upper(), "")
+            r["Salary_Range"] = squash(f"${r['Salary_Min_Board']} - ${r['Salary_Max_Board']} {unit}")
+        else:
+            money = _MONEY_RANGE.search(r.get("Benefits") or text)
+            r["Salary_Range"] = squash(money.group(0)) if money else None
+
+        deadline = _DEADLINE.search(text)
+        r["Closing_Date"] = deadline.group(1) if deadline else None  # validThrough is a board default
+        r["Description"] = squash(text)
+        return r
+
+
+# =============================================================================
+# Careers page with PDF postings (Lotteries and Gaming Saskatchewan)
+# =============================================================================
+PDF_POSTING_SECTIONS = [
+    ("job role", "Job_Summary"),
+    ("summary", "Job_Summary"),
+    ("responsibilit", "Responsibilities"),
+    ("duties", "Responsibilities"),
+    ("qualification", "Qualifications"),
+    ("competenc", "Competencies"),
+    ("eligibility", "Work_Eligibility"),
+    ("other information", None),
+    ("how to apply", "How_To_Apply"),
+]
+_PDF_POSTING_LINK = re.compile(r"job|posting|career|position|opportunit|vacanc", re.I)
+
+
+class PdfPostingsScraper:
+    """Careers page that lists each opening as a link to a PDF posting."""
+
+    def __init__(self, key: str, name: str, career_page: str, http: Http, workers: int = 4):
+        self.key, self.name = key, name
+        self.career_page = career_page
+        self.http = http
+        self.workers = workers
+
+    def list_jobs(self, max_jobs: int | None = None) -> list[dict]:
+        soup = self.http.soup(self.career_page)
+        urls = []
+        for a in soup.find_all("a", href=True):
+            href = urljoin(self.career_page, a["href"])
+            if href.lower().split("?")[0].endswith(".pdf") and _PDF_POSTING_LINK.search(href + " " + a.get_text()):
+                urls.append(href)
+        urls = list(dict.fromkeys(urls))
+        log.info("%s: %d posting PDF(s) on the careers page", self.name, len(urls))
+        items = [{"PDF_URL": u} for u in urls]
+        return items[:max_jobs] if max_jobs else items
+
+    def get_detail(self, listing: dict) -> dict:
+        text, meta = pdf_text(self.http.get(listing["PDF_URL"], accept="application/pdf").content)
+        created = re.match(r"D:(\d{4})(\d{2})(\d{2})", str(meta.get("/CreationDate", "")))
+        return {**listing, "PDF_Text": text, "PDF_Title": meta.get("/Title"),
+                "Posting_Date": "-".join(created.groups()) if created else None}
+
+    def scrape(self, max_jobs: int | None = None) -> list[dict]:
+        return fetch_parallel(self.list_jobs(max_jobs), self.get_detail, self.workers, self.name)
+
+    def enrich(self, record: dict) -> dict:
+        r = dict(record)
+        text = r.pop("PDF_Text", None) or ""
+        lines = [squash(l) for l in text.splitlines()
+                 if squash(l) and not re.fullmatch(r"white text", squash(l), re.I)]  # hidden template text
+        # Header: title, '1 Full Time Permanent Position', 'Compensation: $89,775 - $116,465'
+        r["Job_Title"] = lines[0] if lines else None
+        header = lines[1:5]
+        positions = next((l for l in header if re.search(r"\bpositions?\b", l, re.I)), "")
+        openings = _OPENINGS.match(positions)
+        r["Number_of_Openings"] = int(openings.group(1)) if openings else 1
+        kind = squash(re.sub(r"^\(?\d+\)?\s*|\bpositions?\b", "", positions, flags=re.I))  # 'Full Time Permanent'
+        r["Employment_Type"] = kind or None
+        pay = re.search(r"(?:Compensation|Salary|Pay Range)\s*:\s*(.+)", "\n".join(header), re.I)
+        r["Salary_Range"] = pay.group(1) if pay else None
+        location = re.search(r"^Location\s*:\s*(.+)$", text, re.I | re.M)
+        r["Location_Raw"] = squash(location.group(1)) if location else None
+
+        _, sections = text_sections(lines[1:], PDF_POSTING_SECTIONS, max_words=6)
+        r.update(sections)
+        deadline = _DEADLINE.search(sections.get("How_To_Apply") or text)
+        r["Closing_Date"] = deadline.group(1) if deadline else None
+        pdf_title = str(r.get("PDF_Title") or "")
+        r["Union"] = ("Non-union" if re.search(r"non-?\s*union", pdf_title, re.I)
+                      else union_from_scope(text))
+        r["Job_ID"] = re.sub(r"\.pdf$", "", r["PDF_URL"].rsplit("/", 1)[-1], flags=re.I)
+        r["Organization"] = self.name
+        r["Job_URL"] = r["PDF_URL"]
+        r["Description"] = squash(" ".join(lines))
+        return r
+
+
+# =============================================================================
+# Cleaning shared by all sources
+# =============================================================================
 def finalize(records: Iterable[dict], key: str, source: str, collection_date: str) -> pd.DataFrame:
     df = pd.DataFrame(list(records))
     if df.empty:
@@ -1369,7 +1739,11 @@ def summarize(master: pd.DataFrame) -> pd.DataFrame:
     print(summary.to_string())
     return summary
 
-SOURCE_KEYS = ("gos", "sha", "saskpower", "saskenergy", "saskwater", "sasktel")
+
+# =============================================================================
+# Pipeline
+# =============================================================================
+SOURCE_KEYS = ("gos", "sha", "saskpower", "saskenergy", "saskwater", "sasktel", "sgi", "slga", "lgs")
 
 
 def build_scrapers(http: Http, workers: int) -> dict:
@@ -1391,6 +1765,14 @@ def build_scrapers(http: Http, workers: int) -> dict:
         ), http, workers),
         "saskwater": SaskWaterScraper(SASKWATER_CAREER_PAGE, http, workers),
         "sasktel": SaskTelScraper(SASKTEL_CAREER_SITE, http, workers),
+        "sgi": WorkdayScraper(WorkdaySite(
+            key="SGI", name="SGI",
+            career_page=SGI_CAREER_PAGE,
+            fallback_workday_url="https://sgico.wd10.myworkdayjobs.com/en-US/sgi",
+        ), http, workers),
+        "slga": ApplyToJobScraper("SLGA", "Saskatchewan Liquor and Gaming Authority", SLGA_CAREER_PAGE,
+                                  http, workers, fallback_board="https://slga.applytojob.com"),
+        "lgs": PdfPostingsScraper("LGS", "Lotteries and Gaming Saskatchewan", LGS_CAREER_PAGE, http, workers),
     }
 
 
@@ -1474,14 +1856,14 @@ def run_pipeline(sources: Iterable[str] = SOURCE_KEYS, out_dir: str | Path = "da
 
 
 def main() -> None:
-    import argparse
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--sources", nargs="+", default=list(SOURCE_KEYS), choices=SOURCE_KEYS)
-    p.add_argument("--out-dir", default="data")
-    p.add_argument("--max-jobs", type=int, default=None, help="test run: cap postings per source")
-    p.add_argument("--workers", type=int, default=4)
-    p.add_argument("--delay", type=float, default=0.5)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Scrape Saskatchewan public-sector job postings.")
+    parser.add_argument("--sources", nargs="+", choices=SOURCE_KEYS, default=list(SOURCE_KEYS))
+    parser.add_argument("--out-dir", default="data")
+    parser.add_argument("--max-jobs", type=int, default=None,
+                        help="Cap postings per source (for quick test runs)")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel detail requests")
+    parser.add_argument("--delay", type=float, default=0.5, help="Seconds to wait after each request")
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run_pipeline(args.sources, args.out_dir, args.max_jobs, args.workers, args.delay)
 
