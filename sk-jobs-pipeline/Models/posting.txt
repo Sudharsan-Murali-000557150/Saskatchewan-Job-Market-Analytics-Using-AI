@@ -1,0 +1,18 @@
+Software Developer, Data Acquisition
+Canadian Light Source Inc. - Saskatoon, SK. Full-time, permanent.
+
+CLSI is now accepting applications for a Software Developer in our Data Acquisition team. As a member of the team, the incumbent will participate in the design and development of a replacement data acquisition system for our current beamlines. As a member of the Data Acquisition team, you will be developing in-house systems with custom and community tools (such as Bluesky) as part of the team's mandate to make beamlines more efficient and effective. The new centralized system will provide many interesting and challenging opportunities for professional growth. There will be opportunities to participate and contribute to synchrotron community projects as our own maturity grows in this new space.
+
+Responsibilities:
+- Actively develop standard aspects supporting data acquisition: frontend, device coordination, data pipelines, service communication, and API development.
+- Possess knowledge of connections and dependencies for deployed systems, including databases, scheduled tasks, messaging systems, logging, caches, etc.
+- Understanding of system architecture and knowledge of dependencies between interconnected systems.
+- Architects, designs, implements, and maintains data acquisition software.
+- Undertakes software development projects in a team environment working closely with other developers, clients, other community members, and end-users when applicable.
+- Work with teammates to upgrade and maintain automation pipelines.
+- Troubleshoots and resolves complex problems and incidents for applicable systems while working with other staff and end users to determine the root causes of failure.
+
+Required Qualifications:
+- A relevant undergraduate degree or diploma and a minimum of two years of relevant experience is required.
+- Proven ability to work independently and manage multiple tasks with changing priorities.
+- Strong Python skills.

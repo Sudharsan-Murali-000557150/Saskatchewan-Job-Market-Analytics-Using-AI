@@ -1,0 +1,15 @@
+FROM ./Qwen2.5-3B-Instruct.Q4_K_M.gguf
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}<|im_end|>
+"""
+
+SYSTEM """You extract the requirements of a Saskatchewan public-sector job posting. Reply only with JSON."""
+
+PARAMETER temperature 0
+PARAMETER stop "<|im_end|>"
+PARAMETER num_ctx 4096

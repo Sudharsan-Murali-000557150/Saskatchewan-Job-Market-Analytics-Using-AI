@@ -7,3 +7,4 @@ outputs/
 profiling_output/
 .vscode/
 sk_jobs*.json
+*.gguf
